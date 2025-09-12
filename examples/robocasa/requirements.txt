@@ -1,0 +1,20 @@
+# Basic scientific computing
+numpy>=1.21.0
+einops>=0.6.0
+
+# Data analysis and visualization
+pandas>=1.3.0
+matplotlib>=3.5.0
+seaborn>=0.11.0
+
+# Visualization and logging
+imageio>=2.9.0
+tqdm>=4.62.0
+
+# Argument parsing
+tyro>=0.5.0
+
+# Note: The following should be installed separately in the target environment:
+# - RoboCasa: See https://github.com/robocasa/robocasa for installation
+# - RoboSuite: Installed as dependency of RoboCasa
+# - OpenPI client: pip install -e /path/to/openpi/packages/openpi-client

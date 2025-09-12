@@ -1,0 +1,34 @@
+[
+  {
+    "timestamp": "2025-08-29T10:30:15.123456",
+    "task_name": "CloseDrawer",
+    "success_times": 8,
+    "test_times": 10,
+    "success_rate": 0.8,
+    "result_string": "8/10"
+  },
+  {
+    "timestamp": "2025-08-29T11:45:30.654321",
+    "task_name": "OpenDrawer",
+    "success_times": 7,
+    "test_times": 10,
+    "success_rate": 0.7,
+    "result_string": "7/10"
+  },
+  {
+    "timestamp": "2025-08-29T14:20:45.987654",
+    "task_name": "PickUpObject",
+    "success_times": 5,
+    "test_times": 10,
+    "success_rate": 0.5,
+    "result_string": "5/10"
+  },
+  {
+    "timestamp": "2025-08-29T16:15:20.456789",
+    "task_name": "CloseDrawer",
+    "success_times": 9,
+    "test_times": 10,
+    "success_rate": 0.9,
+    "result_string": "9/10"
+  }
+]

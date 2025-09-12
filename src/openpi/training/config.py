@@ -14,10 +14,13 @@ from typing_extensions import override
 import tyro
 
 import openpi.models.model as _model
+import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0 as pi0
 import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
+import openpi.policies.robocasa_policy as robocasa_policy
+
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
@@ -116,6 +119,19 @@ class ModelTransformFactory(GroupFactory):
                         _transforms.TokenizePrompt(
                             _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
                         ),
+                    ],
+                )
+            case _model.ModelType.PI05:
+                assert isinstance(model_config, pi0_config.Pi0Config)
+                return _transforms.Group(
+                    inputs=[
+                        _transforms.InjectDefaultPrompt(self.default_prompt),
+                        _transforms.ResizeImages(224, 224),
+                        _transforms.TokenizePrompt(
+                            _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+                            discrete_state_input=model_config.discrete_state_input,
+                        ),
+                        _transforms.PadStatesAndActions(model_config.action_dim),
                     ],
                 )
             case _model.ModelType.PI0_FAST:
@@ -250,6 +266,60 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
             model_transforms=model_transforms,
             action_sequence_keys=self.action_sequence_keys,
         )
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotRobocasaDataConfig(DataConfigFactory):
+    # If true, will convert joint dimensions to deltas with respect to the current state before passing to the model.
+    # Gripper dimensions will remain in absolute values.
+    use_delta_joint_actions: bool = True
+    # If provided, will be injected into the input data if the "prompt" key is not present.
+    default_prompt: str | None = None
+    # If true, this will convert the joint and gripper values from the standard Robocasa space to
+    # the space used by the pi internal runtime which was used to train the base model. People who
+    # use standard Robocasa data should set this to true.
+    adapt_to_pi: bool = True
+
+    # Repack transforms.
+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
+        default=_transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images": {"cam_high": "observation.images.top"},
+                        "state": "observation.state",
+                        "actions": "action",
+                    }
+                )
+            ]
+        )
+    )
+    # Action keys that will be used to read the action sequence from the dataset.
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        data_transforms = _transforms.Group(
+            inputs=[robocasa_policy.RobocasaInputs(action_dim=model_config.action_dim, adapt_to_pi=self.adapt_to_pi)],
+            outputs=[robocasa_policy.RobocasaOutputs(adapt_to_pi=self.adapt_to_pi)],
+        )
+        if self.use_delta_joint_actions:
+            delta_action_mask = _transforms.make_bool_mask(-12)
+            # delta_action_mask = _transforms.make_bool_mask(6,-1,4,-1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs),
+            repack_transforms=self.repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+        )
+
 
 
 @dataclasses.dataclass(frozen=True)
@@ -392,7 +462,7 @@ class TrainConfig:
     # Defines the model config. Some attributes (action_dim, action_horizon, and max_token_len) are shared by all models
     # -- see BaseModelConfig. Specific model implementations (e.g., Pi0Config) inherit from BaseModelConfig and may
     # define additional attributes.
-    model: _model.BaseModelConfig = dataclasses.field(default_factory=pi0.Pi0Config)
+    model: _model.BaseModelConfig = dataclasses.field(default_factory=pi0_config.Pi0Config)
 
     # A weight loader can optionally load (possibly partial) weights from disk after the model is initialized.
     weight_loader: weight_loaders.WeightLoader = dataclasses.field(default_factory=weight_loaders.NoOpWeightLoader)
@@ -470,29 +540,922 @@ class TrainConfig:
 
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
+     TrainConfig(
+        name="pi0_aloha_bottle",
+        model=pi0_config.Pi0Config(),
+        data=LeRobotAlohaDataConfig(
+            repo_id="/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/zihao/zh_bottle_task_dataset",
+            # assets=AssetsConfig(
+            #     assets_dir="/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/zihao/zh_task_dataset",
+            #     asset_id="bottle",
+            # ),
+            adapt_to_pi = False,
+            default_prompt="hold the bottle and open the cap",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.cam_high",
+                                "cam_left_wrist": "observation.images.cam_left_wrist",
+                                "cam_right_wrist": "observation.images.cam_right_wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                        }
+                    )
+                ]
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/zihao/local_checkpoint_dir/params"),
+        num_train_steps=30_000,
+    ),
+     
+    TrainConfig(
+        name="pi0_base-move_pen",
+        model=pi0_config.Pi0Config(),
+        data=LeRobotAlohaDataConfig(
+            repo_id="/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/zihao/move_pen2_dataset",  # your datasets repo_id
+            adapt_to_pi=False,
+            repack_transforms=_transforms.Group(inputs=[
+                _transforms.RepackTransform({
+                    "images": {
+                        "cam_high": "observation.images.cam_high",
+                        "cam_left_wrist": "observation.images.cam_left_wrist",
+                        "cam_right_wrist": "observation.images.cam_right_wrist",
+                    },
+                    "state": "observation.state",
+                    "actions": "action",
+                    "prompt": "prompt",
+                })
+            ]),
+            base_config=DataConfig(
+                prompt_from_task=True,  # Set to True for prompt by task_name
+            ),
+        ),
+        freeze_filter=pi0_config.Pi0Config().get_freeze_filter(),
+        batch_size=32,  # the total batch_size not pre_gpu batch_size
+        weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/zihao/local_checkpoint_dir/params"),
+        num_train_steps=30000,
+        fsdp_devices=1,  # refer line 359
+        num_workers=12,
+    ),
+    
+    TrainConfig(
+        name="pi0_base-cube_pp",
+        model=pi0_config.Pi0Config(),
+        data=LeRobotAlohaDataConfig(
+            repo_id="pp_two_cube",  # your datasets repo_id
+            adapt_to_pi=False,
+            repack_transforms=_transforms.Group(inputs=[
+                _transforms.RepackTransform({
+                    "images": {
+                        "cam_high": "observation.images.cam_high",
+                        "cam_left_wrist": "observation.images.cam_left_wrist",
+                        "cam_right_wrist": "observation.images.cam_right_wrist",
+                    },
+                    "state": "observation.state",
+                    "actions": "action",
+                    "prompt": "prompt",
+                })
+            ]),
+            base_config=DataConfig(
+                prompt_from_task=True,  # Set to True for prompt by task_name
+            ),
+        ),
+        freeze_filter=pi0_config.Pi0Config().get_freeze_filter(),
+        batch_size=32,  # the total batch_size not pre_gpu batch_size
+        weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/zihao/local_checkpoint_dir/params"),
+        num_train_steps=50000,
+        fsdp_devices=1,  # refer line 359
+        num_workers=12,
+    ),
+    
+    TrainConfig(
+        name="pi0_base_aloha-open_bottle_cap",
+        model=pi0_config.Pi0Config(),
+        data=LeRobotAlohaDataConfig(
+            # repo_id="open_bottle_cap_cleaned",  For the first 100 data, not involved in demo dataset.
+            repo_id="open_bottle_cap_demo1", # For the first 260 data, involved in demo dataset.
+            adapt_to_pi=False,
+            repack_transforms=_transforms.Group(inputs=[
+                _transforms.RepackTransform({
+                    "images": {
+                        "cam_high": "observation.images.cam_high",
+                        "cam_left_wrist": "observation.images.cam_left_wrist",
+                        "cam_right_wrist": "observation.images.cam_right_wrist",
+                    },
+                    "state": "observation.state",
+                    "actions": "action",
+                    "prompt": "prompt",
+                })
+            ]),
+            base_config=DataConfig(
+                prompt_from_task=True,  # Set to True for prompt by task_name
+            ),
+        ),
+        freeze_filter=pi0_config.Pi0Config().get_freeze_filter(),
+        batch_size=32,  # the total batch_size not pre_gpu batch_size
+        weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/zihao/local_checkpoint_dir/params"),
+        num_train_steps=50000,
+        fsdp_devices=1,  # refer line 359
+        num_workers=12,
+    ),
+    
+    TrainConfig(
+        name="pi0_base_aloha-move_pen",
+        model=pi0_config.Pi0Config(),
+        data=LeRobotAlohaDataConfig(
+            repo_id="move_pen_cleaned",  # your datasets repo_id
+            adapt_to_pi=False,
+            repack_transforms=_transforms.Group(inputs=[
+                _transforms.RepackTransform({
+                    "images": {
+                        "cam_high": "observation.images.cam_high",
+                        "cam_left_wrist": "observation.images.cam_left_wrist",
+                        "cam_right_wrist": "observation.images.cam_right_wrist",
+                    },
+                    "state": "observation.state",
+                    "actions": "action",
+                    "prompt": "prompt",
+                })
+            ]),
+            base_config=DataConfig(
+                prompt_from_task=True,  # Set to True for prompt by task_name
+            ),
+        ),
+        freeze_filter=pi0_config.Pi0Config().get_freeze_filter(),
+        batch_size=32,  # the total batch_size not pre_gpu batch_size
+        weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/zihao/local_checkpoint_dir/params"),
+        num_train_steps=50000,
+        fsdp_devices=1,  # refer line 359
+        num_workers=12,
+    ),
+     
     #
     # Inference Aloha configs.
     #
+    # pi0_base by low-memory finetuning on task0633 (Pick up the tube and insert it into the tube rack).
+    TrainConfig(
+        name="pi0_aloha_tube",
+        model=pi0_config.Pi0Config(max_token_len=60),
+        data=LeRobotAlohaDataConfig(
+            adapt_to_pi = False,
+            repo_id="/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/datasets/task0063_dataset",
+            # assets=AssetsConfig(
+            #     assets_dir="/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/datasets/task0063_dataset",
+            #     asset_id="tube",
+            # ),
+            default_prompt="insert the tube into the holder",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.cam_high",
+                                "cam_left_wrist": "observation.images.cam_left_wrist",
+                                "cam_right_wrist": "observation.images.cam_right_wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                        }
+                    )
+                ]
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/zihao/local_checkpoint_dir"),
+        num_train_steps=60_000,
+    ),
+    
+    TrainConfig(
+        name="pi0_fast_aloha_tube",
+        model=pi0_fast.Pi0FASTConfig(max_token_len=500),
+        data=LeRobotAlohaDataConfig(
+            adapt_to_pi = False,
+            repo_id="/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/datasets/task0063_dataset",
+            # assets=AssetsConfig(
+            #     asset_id="tube",
+            # ),
+            default_prompt="insert the tube into the holder",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.cam_high",
+                                "cam_left_wrist": "observation.images.cam_left_wrist",
+                                "cam_right_wrist": "observation.images.cam_right_wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                        }
+                    )
+                ]
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
+        num_train_steps=200_000,
+    ),
+    
+    TrainConfig(
+        name="pi0_aloha_glasstube",
+        model=pi0_config.Pi0Config(max_token_len=60),
+        data=LeRobotAlohaDataConfig(
+            adapt_to_pi = False,
+            repo_id="/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/datasets/tube_transfer",
+            # assets=AssetsConfig(
+            #     assets_dir="/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/datasets/task0063_dataset",
+            #     asset_id="tube",
+            # ),
+            default_prompt="Move each test tube from the right test tube rack into the corresponding slot of the left test tube rack. Keep the relative order and orientation unchanged",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.cam_high",
+                                "cam_left_wrist": "observation.images.cam_left_wrist",
+                                "cam_right_wrist": "observation.images.cam_right_wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                        }
+                    )
+                ]
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=80_000,
+    ),
+    
+    # TrainConfig(
+    #     name="pi0_fast_aloha_glasstube",
+    #     model=pi0_fast.Pi0FASTConfig(max_token_len=500),
+    #     data=LeRobotAlohaDataConfig(
+    #         repo_id="/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/datasets/glasstube_0825",
+    #         # assets=AssetsConfig(
+    #         #     asset_id="tube",
+    #         # ),
+    #         default_prompt="Move each test tube from the right test tube rack into the corresponding slot of the left test tube rack. Keep the relative order and orientation unchanged.",
+    #         repack_transforms=_transforms.Group(
+    #             inputs=[
+    #                 _transforms.RepackTransform(
+    #                     {
+    #                         "images": {
+    #                             "cam_high": "observation.images.cam_high",
+    #                             "cam_left_wrist": "observation.images.cam_left_wrist",
+    #                             "cam_right_wrist": "observation.images.cam_right_wrist",
+    #                         },
+    #                         "state": "observation.state",
+    #                         "actions": "action",
+    #                     }
+    #                 )
+    #             ]
+    #         ),
+    #     ),
+    #     weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
+    #     num_train_steps=60_000,
+    # ),
+    
+    # TrainConfig(
+    #     name="pi0_fast_robocasa_PnPCounterToCab",
+    #     model=pi0_fast.Pi0FASTConfig(
+    #         action_dim=12,
+    #         action_horizon=32,
+    #         max_token_len=500,
+    #     ),
+    #     data=LeRobotRobocasaDataConfig(
+    #         repo_id="/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/datasets/robocasa_PnPCounterToCab",
+    #         # assets=AssetsConfig(
+    #         #     asset_id="tube",
+    #         # ),
+    #         default_prompt="",
+    #         repack_transforms=_transforms.Group(
+    #             inputs=[
+    #                 _transforms.RepackTransform(
+    #                     {
+    #                         "images": {
+    #                             "cam_left_wrist": "observation.robot0_agentview_left",
+    #                             "cam_right_wrist": "observation.robot0_agentview_right", 
+    #                             "cam_high": "observation.robot0_eye_in_hand",
+    #                             # "cam_high": "observation.images.cam_high",
+    #                             # "cam_left_wrist": "observation.images.cam_left_wrist",
+    #                             # "cam_right_wrist": "observation.images.cam_right_wrist",
+    #                         },
+    #                         "state": "observation.state",
+    #                         "actions": "action",
+    #                     }
+    #                 )
+    #             ]
+    #         ),
+    #     ),
+    #     # weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_droid/params"),
+    #     weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
+    #     num_train_steps=20_000,
+    # ),
+    # TrainConfig(
+    #     name="pi0_fast_robocasa_CoffeePressButton",
+    #     model=pi0_fast.Pi0FASTConfig(
+    #         action_dim=12,
+    #         action_horizon=32,
+    #         max_token_len=500,
+    #     ),
+    #     data=LeRobotRobocasaDataConfig(
+    #         repo_id="/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/datasets/robocasa_CoffeePressButton",
+    #         # assets=AssetsConfig(
+    #         #     asset_id="tube",
+    #         # ),
+    #         default_prompt="press the button on the coffee machine to serve coffee",
+    #         repack_transforms=_transforms.Group(
+    #             inputs=[
+    #                 _transforms.RepackTransform(
+    #                     {
+    #                         "images": {
+    #                             "cam_left_wrist": "observation.robot0_agentview_left",
+    #                             "cam_right_wrist": "observation.robot0_agentview_right", 
+    #                             "cam_high": "observation.robot0_eye_in_hand",
+    #                             # "cam_high": "observation.images.cam_high",
+    #                             # "cam_left_wrist": "observation.images.cam_left_wrist",
+    #                             # "cam_right_wrist": "observation.images.cam_right_wrist",
+    #                         },
+    #                         "state": "observation.state",
+    #                         "actions": "action",
+    #                     }
+    #                 )
+    #             ]
+    #         ),
+    #     ),
+    #     weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_droid/params"),
+    #     # weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
+    #     num_train_steps=80_000,
+    # ),
+    
+    # TrainConfig(
+    #     name="pi0_robocasa_CloseDrawer",
+    #     model=pi0_config.Pi0Config(
+    #         action_dim=32,
+    #         action_horizon=32,
+    #         max_token_len=60),
+    #     data=LeRobotRobocasaDataConfig(
+    #         adapt_to_pi = False,
+    #         repo_id="/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/datasets/robocasa_CloseDrawer",
+    #         # assets=AssetsConfig(
+    #         #     assets_dir="/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/datasets/task0063_dataset",
+    #         #     asset_id="tube",
+    #         # ),
+    #         default_prompt="close the drawer",
+    #         repack_transforms=_transforms.Group(
+    #             inputs=[
+    #                 _transforms.RepackTransform(
+    #                     {
+    #                         "images": {
+    #                             "cam_left_wrist": "observation.robot0_agentview_left",
+    #                             "cam_right_wrist": "observation.robot0_agentview_right", 
+    #                             "cam_high": "observation.robot0_eye_in_hand",
+    #                             # "cam_high": "observation.images.cam_high",
+    #                             # "cam_left_wrist": "observation.images.cam_left_wrist",
+    #                             # "cam_right_wrist": "observation.images.cam_right_wrist",
+    #                         },
+    #                         "state": "observation.state",
+    #                         "actions": "action",
+    #                     }
+    #                 )
+    #             ]
+    #         ),
+    #     ),
+    #     weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+    #     num_train_steps=100_000,
+    # ),
+    TrainConfig(
+        name="pi05_robocasa_mixed_300",
+        model=pi0_config.Pi0Config(
+            action_dim=32,
+            action_horizon=32,
+            max_token_len=300,
+            pi05=True),
+        data=LeRobotRobocasaDataConfig(
+            adapt_to_pi = False,
+            repo_id="/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/datasets/robocasa_300",
+            # assets=AssetsConfig(
+            #     assets_dir="/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/datasets/task0063_dataset",
+            #     asset_id="tube",
+            # ),
+            default_prompt="close the drawer",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_left_wrist": "observation.robot0_agentview_left",
+                                "cam_right_wrist": "observation.robot0_agentview_right", 
+                                "cam_high": "observation.robot0_eye_in_hand",
+                                # "cam_high": "observation.images.cam_high",
+                                # "cam_left_wrist": "observation.images.cam_left_wrist",
+                                # "cam_right_wrist": "observation.images.cam_right_wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt" : "prompt"
+                        }
+                    )
+                ]
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base"),
+        # weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/openpi/checkpoints/pi0_robocasa_mixed/pi0_robocasa_30_continue/199999/params"),
+        
+        num_train_steps=300_000,
+    ),
+    
+    TrainConfig(
+        name="pi0_robocasa_mixed_30",
+        model=pi0_config.Pi0Config(
+            action_dim=32,
+            action_horizon=32,
+            max_token_len=60),
+        data=LeRobotRobocasaDataConfig(
+            adapt_to_pi = False,
+            repo_id="/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/datasets/robocasa_30",
+            # assets=AssetsConfig(
+            #     assets_dir="/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/datasets/task0063_dataset",
+            #     asset_id="tube",
+            # ),
+            default_prompt="close the drawer",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_left_wrist": "observation.robot0_agentview_left",
+                                "cam_right_wrist": "observation.robot0_agentview_right", 
+                                "cam_high": "observation.robot0_eye_in_hand",
+                                # "cam_high": "observation.images.cam_high",
+                                # "cam_left_wrist": "observation.images.cam_left_wrist",
+                                # "cam_right_wrist": "observation.images.cam_right_wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt" : "prompt"
+                        }
+                    )
+                ]
+            ),
+        ),
+        # weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/openpi/checkpoints/pi0_robocasa_mixed_30/pi0_robocasa_mix_30_con/99999/params"),
+        
+        num_train_steps=100_000,
+    ),
+    
+    TrainConfig(
+        name="pi0_robocasa_mixed_100",
+        model=pi0_config.Pi0Config(
+            action_dim=32,
+            action_horizon=32,
+            max_token_len=60),
+        data=LeRobotRobocasaDataConfig(
+            adapt_to_pi = False,
+            repo_id="/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/datasets/robocasa_100",
+            # assets=AssetsConfig(
+            #     assets_dir="/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/datasets/task0063_dataset",
+            #     asset_id="tube",
+            # ),
+            default_prompt="close the drawer",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_left_wrist": "observation.robot0_agentview_left",
+                                "cam_right_wrist": "observation.robot0_agentview_right", 
+                                "cam_high": "observation.robot0_eye_in_hand",
+                                # "cam_high": "observation.images.cam_high",
+                                # "cam_left_wrist": "observation.images.cam_left_wrist",
+                                # "cam_right_wrist": "observation.images.cam_right_wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt" : "prompt"
+                        }
+                    )
+                ]
+            ),
+        ),
+        # weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/openpi/checkpoints/pi0_robocasa_mixed/pi0_robocasa_30_continue/199999/params"),
+        
+        num_train_steps=300_000,
+    ),
+    TrainConfig(
+        name="pi0_robocasa_mixed_300",
+        model=pi0_config.Pi0Config(
+            action_dim=32,
+            action_horizon=32,
+            max_token_len=60),
+        data=LeRobotRobocasaDataConfig(
+            adapt_to_pi = False,
+            repo_id="/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/datasets/robocasa_300",
+            # assets=AssetsConfig(
+            #     assets_dir="/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/datasets/task0063_dataset",
+            #     asset_id="tube",
+            # ),
+            default_prompt="close the drawer",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_left_wrist": "observation.robot0_agentview_left",
+                                "cam_right_wrist": "observation.robot0_agentview_right", 
+                                "cam_high": "observation.robot0_eye_in_hand",
+                                # "cam_high": "observation.images.cam_high",
+                                # "cam_left_wrist": "observation.images.cam_left_wrist",
+                                # "cam_right_wrist": "observation.images.cam_right_wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt" : "prompt"
+                        }
+                    )
+                ]
+            ),
+        ),
+        # weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/openpi/checkpoints/pi0_robocasa_mixed_300/pi0_robocasa_300/371000/params"),
+        num_train_steps=400_000,
+    ),
+    TrainConfig(
+        name="pi0_robocasa_PnPTasks",
+        model=pi0_config.Pi0Config(
+            action_dim=32,
+            action_horizon=32,
+            max_token_len=60),
+        data=LeRobotRobocasaDataConfig(
+            adapt_to_pi = False,
+            repo_id="/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/datasets/action/PnPTasks",
+            # assets=AssetsConfig(
+            #     assets_dir="/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/datasets/task0063_dataset",
+            #     asset_id="tube",
+            # ),
+            default_prompt="close the drawer",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_left_wrist": "observation.robot0_agentview_left",
+                                "cam_right_wrist": "observation.robot0_agentview_right", 
+                                "cam_high": "observation.robot0_eye_in_hand",
+                                # "cam_high": "observation.images.cam_high",
+                                # "cam_left_wrist": "observation.images.cam_left_wrist",
+                                # "cam_right_wrist": "observation.images.cam_right_wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt" : "prompt"
+                        }
+                    )
+                ]
+            ),
+        ),
+        # weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/openpi/checkpoints/pi0_robocasa_mixed_100/pi0_robocasa_100/299999/params"),
+        num_train_steps=30000,
+    ),
+    TrainConfig(
+        name="pi0_robocasa_TurnLevers",
+        model=pi0_config.Pi0Config(
+            action_dim=32,
+            action_horizon=32,
+            max_token_len=60),
+        data=LeRobotRobocasaDataConfig(
+            adapt_to_pi = False,
+            repo_id="/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/datasets/action/TurnLevers",
+            # assets=AssetsConfig(
+            #     assets_dir="/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/datasets/task0063_dataset",
+            #     asset_id="tube",
+            # ),
+            default_prompt="close the drawer",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_left_wrist": "observation.robot0_agentview_left",
+                                "cam_right_wrist": "observation.robot0_agentview_right", 
+                                "cam_high": "observation.robot0_eye_in_hand",
+                                # "cam_high": "observation.images.cam_high",
+                                # "cam_left_wrist": "observation.images.cam_left_wrist",
+                                # "cam_right_wrist": "observation.images.cam_right_wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt" : "prompt"
+                        }
+                    )
+                ]
+            ),
+        ),
+        # weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/openpi/checkpoints/pi0_robocasa_PnPTasks/pi0_robocasa_PnPTasks/29999/params"),
+        num_train_steps=30000,
+    ),
+    TrainConfig(
+        name="pi0_robocasa_TwistKnobs",
+        model=pi0_config.Pi0Config(
+            action_dim=32,
+            action_horizon=32,
+            max_token_len=60),
+        data=LeRobotRobocasaDataConfig(
+            adapt_to_pi = False,
+            repo_id="/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/datasets/action/TwistKnobs",
+            # assets=AssetsConfig(
+            #     assets_dir="/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/datasets/task0063_dataset",
+            #     asset_id="tube",
+            # ),
+            default_prompt="close the drawer",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_left_wrist": "observation.robot0_agentview_left",
+                                "cam_right_wrist": "observation.robot0_agentview_right", 
+                                "cam_high": "observation.robot0_eye_in_hand",
+                                # "cam_high": "observation.images.cam_high",
+                                # "cam_left_wrist": "observation.images.cam_left_wrist",
+                                # "cam_right_wrist": "observation.images.cam_right_wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt" : "prompt"
+                        }
+                    )
+                ]
+            ),
+        ),
+        # weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/openpi/checkpoints/pi0_robocasa_TurnLevers/pi0_robocasa_TurnLevers/29999/params"),
+        num_train_steps=30000,
+    ),
+    TrainConfig(
+        name="pi0_robocasa_InsertTasks",
+        model=pi0_config.Pi0Config(
+            action_dim=32,
+            action_horizon=32,
+            max_token_len=60),
+        data=LeRobotRobocasaDataConfig(
+            adapt_to_pi = False,
+            repo_id="/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/datasets/action/InsertTasks",
+            # assets=AssetsConfig(
+            #     assets_dir="/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/datasets/task0063_dataset",
+            #     asset_id="tube",
+            # ),
+            default_prompt="close the drawer",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_left_wrist": "observation.robot0_agentview_left",
+                                "cam_right_wrist": "observation.robot0_agentview_right", 
+                                "cam_high": "observation.robot0_eye_in_hand",
+                                # "cam_high": "observation.images.cam_high",
+                                # "cam_left_wrist": "observation.images.cam_left_wrist",
+                                # "cam_right_wrist": "observation.images.cam_right_wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt" : "prompt"
+                        }
+                    )
+                ]
+            ),
+        ),
+        # weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/openpi/checkpoints/pi0_robocasa_TwistKnobs/pi0_robocasa_TwistKnobs/29999/params"),
+        num_train_steps=30000,
+    ),
+    TrainConfig(
+        name="pi0_robocasa_ButtonTasks",
+        model=pi0_config.Pi0Config(
+            action_dim=32,
+            action_horizon=32,
+            max_token_len=60),
+        data=LeRobotRobocasaDataConfig(
+            adapt_to_pi = False,
+            repo_id="/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/datasets/action/ButtonTasks",
+            # assets=AssetsConfig(
+            #     assets_dir="/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/datasets/task0063_dataset",
+            #     asset_id="tube",
+            # ),
+            default_prompt="close the drawer",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_left_wrist": "observation.robot0_agentview_left",
+                                "cam_right_wrist": "observation.robot0_agentview_right", 
+                                "cam_high": "observation.robot0_eye_in_hand",
+                                # "cam_high": "observation.images.cam_high",
+                                # "cam_left_wrist": "observation.images.cam_left_wrist",
+                                # "cam_right_wrist": "observation.images.cam_right_wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt" : "prompt"
+                        }
+                    )
+                ]
+            ),
+        ),
+        # weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/openpi/checkpoints/pi0_robocasa_InsertTasks/pi0_robocasa_InsertTasks/29999/params"),
+        num_train_steps=30000,
+    ),
+    TrainConfig(
+        name="pi0_robocasa_CloseTasks",
+        model=pi0_config.Pi0Config(
+            action_dim=32,
+            action_horizon=32,
+            max_token_len=60),
+        data=LeRobotRobocasaDataConfig(
+            adapt_to_pi = False,
+            repo_id="/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/datasets/action/CloseTasks",
+            # assets=AssetsConfig(
+            #     assets_dir="/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/datasets/task0063_dataset",
+            #     asset_id="tube",
+            # ),
+            default_prompt="close the drawer",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_left_wrist": "observation.robot0_agentview_left",
+                                "cam_right_wrist": "observation.robot0_agentview_right", 
+                                "cam_high": "observation.robot0_eye_in_hand",
+                                # "cam_high": "observation.images.cam_high",
+                                # "cam_left_wrist": "observation.images.cam_left_wrist",
+                                # "cam_right_wrist": "observation.images.cam_right_wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt" : "prompt"
+                        }
+                    )
+                ]
+            ),
+        ),
+        # weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/openpi/checkpoints/pi0_robocasa_ButtonTasks/pi0_robocasa_ButtonTasks/29999/params"),
+        num_train_steps=30000,
+    ),
+    TrainConfig(
+        name="pi0_robocasa_OpenTasks",
+        model=pi0_config.Pi0Config(
+            action_dim=32,
+            action_horizon=32,
+            max_token_len=60),
+        data=LeRobotRobocasaDataConfig(
+            adapt_to_pi = False,
+            repo_id="/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/datasets/action/OpenTasks",
+            # assets=AssetsConfig(
+            #     assets_dir="/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/datasets/task0063_dataset",
+            #     asset_id="tube",
+            # ),
+            default_prompt="close the drawer",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_left_wrist": "observation.robot0_agentview_left",
+                                "cam_right_wrist": "observation.robot0_agentview_right", 
+                                "cam_high": "observation.robot0_eye_in_hand",
+                                # "cam_high": "observation.images.cam_high",
+                                # "cam_left_wrist": "observation.images.cam_left_wrist",
+                                # "cam_right_wrist": "observation.images.cam_right_wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt" : "prompt"
+                        }
+                    )
+                ]
+            ),
+        ),
+        # weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/openpi/checkpoints/pi0_robocasa_CloseTasks/pi0_robocasa_CloseTasks/29999/params"),
+        num_train_steps=30000,
+    ),
+
+    TrainConfig(name="pi0_robocasa_CloseDoubleDoor", model=pi0_config.Pi0Config(action_dim=32, action_horizon=32, max_token_len=60), data=LeRobotRobocasaDataConfig(adapt_to_pi=False, repo_id="/root/.cache/huggingface/lerobot/robocasa/CloseDoubleDoor", default_prompt="close the double door", repack_transforms=_transforms.Group(inputs=[_transforms.RepackTransform({"images":{"cam_left_wrist":"observation.robot0_agentview_left","cam_right_wrist":"observation.robot0_agentview_right","cam_high":"observation.robot0_eye_in_hand"},"state":"observation.state","actions":"action"})])), weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"), num_train_steps=60000),
+
+    TrainConfig(name="pi0_robocasa_CloseDrawer", model=pi0_config.Pi0Config(action_dim=32, action_horizon=32, max_token_len=60), data=LeRobotRobocasaDataConfig(adapt_to_pi=False, repo_id="/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/datasets/robocasa_CloseDrawer", default_prompt="close the drawer", repack_transforms=_transforms.Group(inputs=[_transforms.RepackTransform({"images":{"cam_left_wrist":"observation.robot0_agentview_left","cam_right_wrist":"observation.robot0_agentview_right","cam_high":"observation.robot0_eye_in_hand"},"state":"observation.state","actions":"action"})])), weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"), num_train_steps=100_000, batch_size=32),
+
+    TrainConfig(name="pi0_robocasa_CloseSingleDoor", model=pi0_config.Pi0Config(action_dim=32, action_horizon=32, max_token_len=60), data=LeRobotRobocasaDataConfig(adapt_to_pi=False, repo_id="/root/.cache/huggingface/lerobot/robocasa/CloseDSingleoor", default_prompt="close the single door", repack_transforms=_transforms.Group(inputs=[_transforms.RepackTransform({"images":{"cam_left_wrist":"observation.robot0_agentview_left","cam_right_wrist":"observation.robot0_agentview_right","cam_high":"observation.robot0_eye_in_hand"},"state":"observation.state","actions":"action"})])), weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/openpi/checkpoints/pi0_robocasa_CloseSingleDoor/CloseSingleDoor/17000/params"), num_train_steps=83000),
+
+    TrainConfig(name="pi0_robocasa_CoffeePressButton", model=pi0_config.Pi0Config(action_dim=32, action_horizon=32, max_token_len=60), data=LeRobotRobocasaDataConfig(adapt_to_pi=False, repo_id="/root/.cache/huggingface/lerobot/robocasa/CoffeePressButton", default_prompt="press the coffee button", repack_transforms=_transforms.Group(inputs=[_transforms.RepackTransform({"images":{"cam_left_wrist":"observation.robot0_agentview_left","cam_right_wrist":"observation.robot0_agentview_right","cam_high":"observation.robot0_eye_in_hand"},"state":"observation.state","actions":"action"})])), weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/openpi_tmp/checkpoints/pi0_robocasa_CoffeePressButton/pi0_robocasa_CoffeePressButton/39000/params"), num_train_steps=41000),
+
+    TrainConfig(name="pi0_robocasa_CoffeeServeMug", model=pi0_config.Pi0Config(action_dim=32, action_horizon=32, max_token_len=60), data=LeRobotRobocasaDataConfig(adapt_to_pi=False, repo_id="/root/.cache/huggingface/lerobot/robocasa/CoffeeServeMug", default_prompt="serve the coffee mug", repack_transforms=_transforms.Group(inputs=[_transforms.RepackTransform({"images":{"cam_left_wrist":"observation.robot0_agentview_left","cam_right_wrist":"observation.robot0_agentview_right","cam_high":"observation.robot0_eye_in_hand"},"state":"observation.state","actions":"action"})])), weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"), num_train_steps=60000),
+
+    TrainConfig(name="pi0_robocasa_CoffeeSetupMug", model=pi0_config.Pi0Config(action_dim=32, action_horizon=32, max_token_len=60), data=LeRobotRobocasaDataConfig(adapt_to_pi=False, repo_id="/root/.cache/huggingface/lerobot/robocasa/CoffeeSetupMug", default_prompt="set up the coffee mug", repack_transforms=_transforms.Group(inputs=[_transforms.RepackTransform({"images":{"cam_left_wrist":"observation.robot0_agentview_left","cam_right_wrist":"observation.robot0_agentview_right","cam_high":"observation.robot0_eye_in_hand"},"state":"observation.state","actions":"action"})])), weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/openpi/checkpoints/pi0_robocasa_CoffeeSetupMug/CoffeeSetupMug/33000/params"), num_train_steps=67000),
+
+    TrainConfig(name="pi0_robocasa_OpenDoubleDoor", model=pi0_config.Pi0Config(action_dim=32, action_horizon=32, max_token_len=60), data=LeRobotRobocasaDataConfig(adapt_to_pi=False, repo_id="/root/.cache/huggingface/lerobot/robocasa/OpenDoubleDoor", default_prompt="open the double door", repack_transforms=_transforms.Group(inputs=[_transforms.RepackTransform({"images":{"cam_left_wrist":"observation.robot0_agentview_left","cam_right_wrist":"observation.robot0_agentview_right","cam_high":"observation.robot0_eye_in_hand"},"state":"observation.state","actions":"action"})])), weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"), num_train_steps=60000),
+
+    TrainConfig(name="pi0_robocasa_OpenDrawer", model=pi0_config.Pi0Config(action_dim=32, action_horizon=32, max_token_len=60), data=LeRobotRobocasaDataConfig(adapt_to_pi=False, repo_id="/root/.cache/huggingface/lerobot/robocasa/OpenDrawer", default_prompt="open the drawer", repack_transforms=_transforms.Group(inputs=[_transforms.RepackTransform({"images":{"cam_left_wrist":"observation.robot0_agentview_left","cam_right_wrist":"observation.robot0_agentview_right","cam_high":"observation.robot0_eye_in_hand"},"state":"observation.state","actions":"action"})])), weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"), num_train_steps=60000),
+
+    TrainConfig(name="pi0_robocasa_OpenSingleDoor", model=pi0_config.Pi0Config(action_dim=32, action_horizon=32, max_token_len=60), data=LeRobotRobocasaDataConfig(adapt_to_pi=False, repo_id="/root/.cache/huggingface/lerobot/robocasa/OpenSingleDoor", default_prompt="open the single door", repack_transforms=_transforms.Group(inputs=[_transforms.RepackTransform({"images":{"cam_left_wrist":"observation.robot0_agentview_left","cam_right_wrist":"observation.robot0_agentview_right","cam_high":"observation.robot0_eye_in_hand"},"state":"observation.state","actions":"action"})])), weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"), num_train_steps=100_000),
+
+    TrainConfig(name="pi0_robocasa_PnP_Cab2Counter", model=pi0_config.Pi0Config(action_dim=32, action_horizon=32, max_token_len=60), data=LeRobotRobocasaDataConfig(adapt_to_pi=False, repo_id="/root/.cache/huggingface/lerobot/robocasa/PnPCabToCounter", default_prompt="pick and place from cabinet to counter", repack_transforms=_transforms.Group(inputs=[_transforms.RepackTransform({"images":{"cam_left_wrist":"observation.robot0_agentview_left","cam_right_wrist":"observation.robot0_agentview_right","cam_high":"observation.robot0_eye_in_hand"},"state":"observation.state","actions":"action"})])), weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"), num_train_steps=60000),
+
+    TrainConfig(name="pi0_robocasa_PnPCounterToCab", model=pi0_config.Pi0Config(action_dim=32, action_horizon=32, max_token_len=60), data=LeRobotRobocasaDataConfig(adapt_to_pi=False, repo_id="/root/.cache/huggingface/lerobot/robocasa/PnPCounterToCab", default_prompt="pick and place from counter to cabinet", repack_transforms=_transforms.Group(inputs=[_transforms.RepackTransform({"images":{"cam_left_wrist":"observation.robot0_agentview_left","cam_right_wrist":"observation.robot0_agentview_right","cam_high":"observation.robot0_eye_in_hand"},"state":"observation.state","actions":"action"})])), weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/openpi/checkpoints/pi0_robocasa_PnPCounterToCab/PnPCounterToCab/16000/params"), num_train_steps=84000),
+
+    TrainConfig(name="pi0_robocasa_PnP_Counter2Microwave", model=pi0_config.Pi0Config(action_dim=32, action_horizon=32, max_token_len=60), data=LeRobotRobocasaDataConfig(adapt_to_pi=False, repo_id="/root/.cache/huggingface/lerobot/robocasa/PnPCounterToMicrowave", default_prompt="pick and place from counter to microwave", repack_transforms=_transforms.Group(inputs=[_transforms.RepackTransform({"images":{"cam_left_wrist":"observation.robot0_agentview_left","cam_right_wrist":"observation.robot0_agentview_right","cam_high":"observation.robot0_eye_in_hand"},"state":"observation.state","actions":"action"})])), weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"), num_train_steps=100_000),
+
+    TrainConfig(name="pi0_robocasa_PnP_Counter2Sink", model=pi0_config.Pi0Config(action_dim=32, action_horizon=32, max_token_len=60), data=LeRobotRobocasaDataConfig(adapt_to_pi=False, repo_id="/root/.cache/huggingface/lerobot/robocasa/PnPCounterToSink", default_prompt="pick and place from counter to sink", repack_transforms=_transforms.Group(inputs=[_transforms.RepackTransform({"images":{"cam_left_wrist":"observation.robot0_agentview_left","cam_right_wrist":"observation.robot0_agentview_right","cam_high":"observation.robot0_eye_in_hand"},"state":"observation.state","actions":"action"})])), weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"), num_train_steps=100_000),
+
+    TrainConfig(name="pi0_robocasa_PnP_Counter2Stove", model=pi0_config.Pi0Config(action_dim=32, action_horizon=32, max_token_len=60), data=LeRobotRobocasaDataConfig(adapt_to_pi=False, repo_id="/root/.cache/huggingface/lerobot/robocasa/PnPCounterToStove", default_prompt="pick and place from counter to stove", repack_transforms=_transforms.Group(inputs=[_transforms.RepackTransform({"images":{"cam_left_wrist":"observation.robot0_agentview_left","cam_right_wrist":"observation.robot0_agentview_right","cam_high":"observation.robot0_eye_in_hand"},"state":"observation.state","actions":"action"})])), weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"), num_train_steps=100_000),
+
+    TrainConfig(name="pi0_robocasa_PnP_Microwave2Counter", model=pi0_config.Pi0Config(action_dim=32, action_horizon=32, max_token_len=60), data=LeRobotRobocasaDataConfig(adapt_to_pi=False, repo_id="/root/.cache/huggingface/lerobot/robocasa/PnPMicrowaveToCounter", default_prompt="pick and place from microwave to counter", repack_transforms=_transforms.Group(inputs=[_transforms.RepackTransform({"images":{"cam_left_wrist":"observation.robot0_agentview_left","cam_right_wrist":"observation.robot0_agentview_right","cam_high":"observation.robot0_eye_in_hand"},"state":"observation.state","actions":"action"})])), weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"), num_train_steps=60000),
+
+    TrainConfig(name="pi0_robocasa_PnP_Sink2Counter", model=pi0_config.Pi0Config(action_dim=32, action_horizon=32, max_token_len=60), data=LeRobotRobocasaDataConfig(adapt_to_pi=False, repo_id="/root/.cache/huggingface/lerobot/robocasa/PnPSinkToCounter", default_prompt="pick and place from sink to counter", repack_transforms=_transforms.Group(inputs=[_transforms.RepackTransform({"images":{"cam_left_wrist":"observation.robot0_agentview_left","cam_right_wrist":"observation.robot0_agentview_right","cam_high":"observation.robot0_eye_in_hand"},"state":"observation.state","actions":"action"})])), weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"), num_train_steps=60000),
+
+    TrainConfig(name="pi0_robocasa_PnP_Stove2Counter", model=pi0_config.Pi0Config(action_dim=32, action_horizon=32, max_token_len=60), data=LeRobotRobocasaDataConfig(adapt_to_pi=False, repo_id="/root/.cache/huggingface/lerobot/robocasa/PnPStoveToCounter", default_prompt="pick and place from stove to counter", repack_transforms=_transforms.Group(inputs=[_transforms.RepackTransform({"images":{"cam_left_wrist":"observation.robot0_agentview_left","cam_right_wrist":"observation.robot0_agentview_right","cam_high":"observation.robot0_eye_in_hand"},"state":"observation.state","actions":"action"})])), weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"), num_train_steps=60000),
+
+    TrainConfig(name="pi0_robocasa_TurnOffMicrowave", model=pi0_config.Pi0Config(action_dim=32, action_horizon=32, max_token_len=60), data=LeRobotRobocasaDataConfig(adapt_to_pi=False, repo_id="/root/.cache/huggingface/lerobot/robocasa/TurnOffMicrowave", default_prompt="turn off the microwave", repack_transforms=_transforms.Group(inputs=[_transforms.RepackTransform({"images":{"cam_left_wrist":"observation.robot0_agentview_left","cam_right_wrist":"observation.robot0_agentview_right","cam_high":"observation.robot0_eye_in_hand"},"state":"observation.state","actions":"action"})])), weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/openpi_tmp/checkpoints/pi0_robocasa_TurnOffMicrowave/pi0_robocasa_TurnOffMicrowave/78000/params"), num_train_steps=60000),
+
+    TrainConfig(name="pi0_robocasa_TurnOffSinkFaucet", model=pi0_config.Pi0Config(action_dim=32, action_horizon=32, max_token_len=60), data=LeRobotRobocasaDataConfig(adapt_to_pi=False, repo_id="/root/.cache/huggingface/lerobot/robocasa/TurnOffSinkFaucet", default_prompt="turn off the sink faucet", repack_transforms=_transforms.Group(inputs=[_transforms.RepackTransform({"images":{"cam_left_wrist":"observation.robot0_agentview_left","cam_right_wrist":"observation.robot0_agentview_right","cam_high":"observation.robot0_eye_in_hand"},"state":"observation.state","actions":"action"})])), weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"), num_train_steps=60000),
+
+    TrainConfig(name="pi0_robocasa_TurnOffStove", model=pi0_config.Pi0Config(action_dim=32, action_horizon=32, max_token_len=60), data=LeRobotRobocasaDataConfig(adapt_to_pi=False, repo_id="/root/.cache/huggingface/lerobot/robocasa/TurnOffStove", default_prompt="turn off the stove", repack_transforms=_transforms.Group(inputs=[_transforms.RepackTransform({"images":{"cam_left_wrist":"observation.robot0_agentview_left","cam_right_wrist":"observation.robot0_agentview_right","cam_high":"observation.robot0_eye_in_hand"},"state":"observation.state","actions":"action"})])), weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"), num_train_steps=60000),
+
+    TrainConfig(name="pi0_robocasa_TurnOnMicrowave", model=pi0_config.Pi0Config(action_dim=32, action_horizon=32, max_token_len=60), data=LeRobotRobocasaDataConfig(adapt_to_pi=False, repo_id="/root/.cache/huggingface/lerobot/robocasa/TurnOnMicrowave", default_prompt="turn on the microwave", repack_transforms=_transforms.Group(inputs=[_transforms.RepackTransform({"images":{"cam_left_wrist":"observation.robot0_agentview_left","cam_right_wrist":"observation.robot0_agentview_right","cam_high":"observation.robot0_eye_in_hand"},"state":"observation.state","actions":"action"})])), weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"), num_train_steps=60000),
+
+    TrainConfig(name="pi0_robocasa_TurnOnSinkFaucet", model=pi0_config.Pi0Config(action_dim=32, action_horizon=32, max_token_len=60), data=LeRobotRobocasaDataConfig(adapt_to_pi=False, repo_id="/root/.cache/huggingface/lerobot/robocasa/TurnOnSinkFaucet", default_prompt="turn on the sink faucet", repack_transforms=_transforms.Group(inputs=[_transforms.RepackTransform({"images":{"cam_left_wrist":"observation.robot0_agentview_left","cam_right_wrist":"observation.robot0_agentview_right","cam_high":"observation.robot0_eye_in_hand"},"state":"observation.state","actions":"action"})])), weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"), num_train_steps=100_000),
+
+    TrainConfig(name="pi0_robocasa_TurnOnStove", model=pi0_config.Pi0Config(action_dim=32, action_horizon=32, max_token_len=60), data=LeRobotRobocasaDataConfig(adapt_to_pi=False, repo_id="/root/.cache/huggingface/lerobot/robocasa/TurnOnStove", default_prompt="turn on the stove", repack_transforms=_transforms.Group(inputs=[_transforms.RepackTransform({"images":{"cam_left_wrist":"observation.robot0_agentview_left","cam_right_wrist":"observation.robot0_agentview_right","cam_high":"observation.robot0_eye_in_hand"},"state":"observation.state","actions":"action"})])), weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"), num_train_steps=100_000),
+
+    TrainConfig(name="pi0_robocasa_TurnSinkSpout", model=pi0_config.Pi0Config(action_dim=32, action_horizon=32, max_token_len=60), data=LeRobotRobocasaDataConfig(adapt_to_pi=False, repo_id="/root/.cache/huggingface/lerobot/robocasa/TurnSinkSpout", default_prompt="turn the sink spout", repack_transforms=_transforms.Group(inputs=[_transforms.RepackTransform({"images":{"cam_left_wrist":"observation.robot0_agentview_left","cam_right_wrist":"observation.robot0_agentview_right","cam_high":"observation.robot0_eye_in_hand"},"state":"observation.state","actions":"action"})])), weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"), num_train_steps=100_000),
+
+    
+    TrainConfig(
+        name="pi0_fast_robocasa_CloseDrawer",
+        model=pi0_fast.Pi0FASTConfig(
+            action_dim=32,
+            action_horizon=32,
+            max_token_len=500,
+        ),
+        data=LeRobotRobocasaDataConfig(
+            repo_id="/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/datasets/robocasa_CloseDrawer",
+            # assets=AssetsConfig(
+            #     asset_id="tube",
+            # ),
+            default_prompt="close the drawer",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_left_wrist": "observation.robot0_agentview_left",
+                                "cam_right_wrist": "observation.robot0_agentview_right", 
+                                "cam_high": "observation.robot0_eye_in_hand",
+                                # "cam_high": "observation.images.cam_high",
+                                # "cam_left_wrist": "observation.images.cam_left_wrist",
+                                # "cam_right_wrist": "observation.images.cam_right_wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                        }
+                    )
+                ]
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_droid/params"),
+        # weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
+        num_train_steps=80_000,
+    ),
     TrainConfig(
         name="pi0_aloha",
-        model=pi0.Pi0Config(),
+        model=pi0_config.Pi0Config(),
         data=LeRobotAlohaDataConfig(
             assets=AssetsConfig(asset_id="trossen"),
         ),
-        policy_metadata={"reset_pose": [0, -1.5, 1.5, 0, 0, 0]},
+        # policy_metadata={"reset_pose": [0, -1.5, 1.5, 0, 0, 0]},
     ),
     TrainConfig(
         name="pi0_aloha_towel",
-        model=pi0.Pi0Config(),
+        model=pi0_config.Pi0Config(),
         data=LeRobotAlohaDataConfig(
             assets=AssetsConfig(asset_id="trossen"),
             default_prompt="fold the towel",
         ),
-        policy_metadata={"reset_pose": [0, -1.5, 1.5, 0, 0, 0]},
+        # policy_metadata={"reset_pose": [0, -1.5, 1.5, 0, 0, 0]},
     ),
     TrainConfig(
         name="pi0_aloha_tupperware",
-        model=pi0.Pi0Config(),
+        model=pi0_config.Pi0Config(),
         data=LeRobotAlohaDataConfig(
             assets=AssetsConfig(asset_id="trossen"),
             default_prompt="open the tupperware and put the food on the plate",
@@ -504,7 +1467,7 @@ _CONFIGS = [
     #
     TrainConfig(
         name="pi0_droid",
-        model=pi0.Pi0Config(action_horizon=10),
+        model=pi0_config.Pi0Config(action_horizon=10),
         data=SimpleDataConfig(
             assets=AssetsConfig(asset_id="droid"),
             data_transforms=lambda model: _transforms.Group(
@@ -544,7 +1507,7 @@ _CONFIGS = [
         # Here you define the model config -- In this example we use pi0 as the model
         # architecture and perform *full* finetuning. in the examples below we show how to modify
         # this to perform *low-memory* (LORA) finetuning and use pi0-FAST as an alternative architecture.
-        model=pi0.Pi0Config(),
+        model=pi0_config.Pi0Config(),
         # Here you define the dataset you are training on. In this example we use the Libero
         # dataset. For your own dataset, you can change the repo_id to point to your dataset.
         # Also modify the DataConfig to use the new config you made for your dataset above.
@@ -567,7 +1530,7 @@ _CONFIGS = [
     TrainConfig(
         name="pi0_libero_low_mem_finetune",
         # Here is an example of loading a pi0 model for LoRA fine-tuning.
-        model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        model=pi0_config.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
         data=LeRobotLiberoDataConfig(
             repo_id="physical-intelligence/libero",
             base_config=DataConfig(prompt_from_task=True),
@@ -578,7 +1541,7 @@ _CONFIGS = [
         # We have a convenience function in the model config that returns the default freeze filter
         # for the given model config for LoRA finetuning. Just make sure it matches the model config
         # you chose above.
-        freeze_filter=pi0.Pi0Config(
+        freeze_filter=pi0_config.Pi0Config(
             paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
         ).get_freeze_filter(),
         # Turn off EMA for LoRA finetuning.
@@ -633,7 +1596,7 @@ _CONFIGS = [
     # For instuctions on how to convert and train on your own Aloha dataset see examples/aloha_real/README.md
     TrainConfig(
         name="pi0_aloha_pen_uncap",
-        model=pi0.Pi0Config(),
+        model=pi0_config.Pi0Config(),
         data=LeRobotAlohaDataConfig(
             repo_id="physical-intelligence/aloha_pen_uncap_diverse",
             assets=AssetsConfig(
@@ -684,7 +1647,7 @@ _CONFIGS = [
             decay_lr=5e-5,
         ),
         num_train_steps=100_000,  # 100k steps should be sufficient, takes ~2 days on 8x H100s
-        batch_size=256,
+        batch_size=64,
         log_interval=100,
         save_interval=5000,
         keep_period=20_000,
@@ -695,7 +1658,7 @@ _CONFIGS = [
     #
     TrainConfig(
         name="pi0_aloha_sim",
-        model=pi0.Pi0Config(),
+        model=pi0_config.Pi0Config(),
         data=LeRobotAlohaDataConfig(
             repo_id="lerobot/aloha_sim_transfer_cube_human",
             default_prompt="Transfer cube",
@@ -711,7 +1674,7 @@ _CONFIGS = [
         name="debug",
         data=FakeDataConfig(),
         batch_size=2,
-        model=pi0.Pi0Config(paligemma_variant="dummy", action_expert_variant="dummy"),
+        model=pi0_config.Pi0Config(paligemma_variant="dummy", action_expert_variant="dummy"),
         save_interval=100,
         overwrite=True,
         exp_name="debug",
@@ -722,7 +1685,7 @@ _CONFIGS = [
         name="debug_restore",
         data=FakeDataConfig(),
         batch_size=2,
-        model=pi0.Pi0Config(paligemma_variant="dummy", action_expert_variant="dummy"),
+        model=pi0_config.Pi0Config(paligemma_variant="dummy", action_expert_variant="dummy"),
         weight_loader=weight_loaders.CheckpointWeightLoader("./checkpoints/debug/debug/9/params"),
         overwrite=True,
         exp_name="debug",
